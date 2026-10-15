@@ -1,10 +1,11 @@
-// #define main worklet1_main
-// #include "worklet1.cpp"
+#define main worklet1_main
+#include "worklet1.cpp"
 #undef main
 
 #include "worklet2.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -85,7 +86,56 @@ bool lookupOp(const string& m, w2::Op& op) {
     if (m == "POPAD")  { op = w2::Op::POPAD;  return true; }
     if (m == "PUSHFD") { op = w2::Op::PUSHFD; return true; }
     if (m == "POPFD")  { op = w2::Op::POPFD;  return true; }
-    return false;   // LOAD / STORE are handled separately
+    // ---- 8/16-bit extension ----
+    if (m == "SAL")    { op = w2::Op::SHL;    return true; }   // SAL == SHL
+    if (m == "ROL")    { op = w2::Op::ROL;    return true; }
+    if (m == "ROR")    { op = w2::Op::ROR;    return true; }
+    if (m == "RCL")    { op = w2::Op::RCL;    return true; }
+    if (m == "RCR")    { op = w2::Op::RCR;    return true; }
+    if (m == "CMC")    { op = w2::Op::CMC;    return true; }
+    if (m == "CWDE")   { op = w2::Op::CWDE;   return true; }
+    if (m == "CBW")    { op = w2::Op::CBW;    return true; }
+    if (m == "CWD")    { op = w2::Op::CWD;    return true; }
+    if (m == "PUSHA")  { op = w2::Op::PUSHA;  return true; }
+    if (m == "POPA")   { op = w2::Op::POPA;   return true; }
+    if (m == "PUSHF")  { op = w2::Op::PUSHF;  return true; }
+    if (m == "POPF")   { op = w2::Op::POPF;   return true; }
+    if (m == "LODSB")  { op = w2::Op::LODSB;  return true; }
+    if (m == "LODSW")  { op = w2::Op::LODSW;  return true; }
+    if (m == "LODSD")  { op = w2::Op::LODSD;  return true; }
+    if (m == "STOSB")  { op = w2::Op::STOSB;  return true; }
+    if (m == "STOSW")  { op = w2::Op::STOSW;  return true; }
+    if (m == "STOSD")  { op = w2::Op::STOSD;  return true; }
+    if (m == "JO")     { op = w2::Op::JO;     return true; }
+    if (m == "JNO")    { op = w2::Op::JNO;    return true; }
+    if (m == "JP")     { op = w2::Op::JP;     return true; }
+    if (m == "JPE")    { op = w2::Op::JP;     return true; }
+    if (m == "JNP")    { op = w2::Op::JNP;    return true; }
+    if (m == "JPO")    { op = w2::Op::JNP;    return true; }
+    // ---- carry arithmetic, remaining string ops, flag / control, short loops ----
+    if (m == "ADC")    { op = w2::Op::ADC;    return true; }
+    if (m == "SBB")    { op = w2::Op::SBB;    return true; }
+    if (m == "MOVSB")  { op = w2::Op::MOVSB;  return true; }
+    if (m == "MOVSW")  { op = w2::Op::MOVSW;  return true; }
+    if (m == "MOVSD")  { op = w2::Op::MOVSD;  return true; }
+    if (m == "CMPSB")  { op = w2::Op::CMPSB;  return true; }
+    if (m == "CMPSW")  { op = w2::Op::CMPSW;  return true; }
+    if (m == "CMPSD")  { op = w2::Op::CMPSD;  return true; }
+    if (m == "SCASB")  { op = w2::Op::SCASB;  return true; }
+    if (m == "SCASW")  { op = w2::Op::SCASW;  return true; }
+    if (m == "SCASD")  { op = w2::Op::SCASD;  return true; }
+    if (m == "LAHF")   { op = w2::Op::LAHF;   return true; }
+    if (m == "SAHF")   { op = w2::Op::SAHF;   return true; }
+    if (m == "CLI")    { op = w2::Op::CLI;    return true; }
+    if (m == "STI")    { op = w2::Op::STI;    return true; }
+    if (m == "WAIT")   { op = w2::Op::WAIT;   return true; }
+    if (m == "LOOP")   { op = w2::Op::LOOP;   return true; }
+    if (m == "LOOPE")  { op = w2::Op::LOOPE;  return true; }
+    if (m == "LOOPZ")  { op = w2::Op::LOOPE;  return true; }   // alias of LOOPE
+    if (m == "LOOPNE") { op = w2::Op::LOOPNE; return true; }
+    if (m == "LOOPNZ") { op = w2::Op::LOOPNE; return true; }   // alias of LOOPNE
+    if (m == "JECXZ")  { op = w2::Op::JECXZ;  return true; }
+    return false;   // LOAD / STORE / LODS / STOS are handled separately
 }
 
 bool lookupReg(const string& name, w2::Reg& r) {
@@ -100,6 +150,64 @@ bool lookupReg(const string& name, w2::Reg& r) {
     return false;
 }
 
+// Any general register (32-, 16- or 8-bit) -> encoding number + width in bits.
+// Segment registers are not supported.
+bool lookupRegSized(const string& name, w2::Reg& r, uint8_t& bits) {
+    if (lookupReg(name, r)) { bits = 32; return true; }
+    static const char* r16[8] = { "AX", "CX", "DX", "BX", "SP", "BP", "SI", "DI" };
+    static const char* r8[8]  = { "AL", "CL", "DL", "BL", "AH", "CH", "DH", "BH" };
+    for (int i = 0; i < 8; ++i) {
+        if (name == r16[i]) { r = static_cast<w2::Reg>(i); bits = 16; return true; }
+        if (name == r8[i])  { r = static_cast<w2::Reg>(i); bits = 8;  return true; }
+    }
+    return false;
+}
+
+// Worklet 1's memory-expression parser keeps no sign for registers/labels, lets a second scaled
+// register overwrite the first, and lets a second label overwrite the first. Each of those
+// would silently produce the WRONG address, so re-inspect the raw "[...]" text and refuse them.
+// (Worklet 1 itself is untouched; this only looks at the text it already stored in Operand::value.)
+bool memExprProblem(const string& raw, string& why) {
+    const size_t lb = raw.find('['), rb = raw.rfind(']');
+    if (lb == string::npos || rb == string::npos || rb < lb) return false;
+    string s;
+    for (size_t k = lb + 1; k < rb; ++k) if (!isspace(static_cast<unsigned char>(raw[k]))) s += raw[k];
+
+    int regs = 0, scaled = 0, labels = 0;
+    size_t i = 0;
+    char sign = '+';
+    if (!s.empty() && (s[0] == '+' || s[0] == '-')) { sign = s[0]; i = 1; }
+    while (i <= s.size()) {
+        size_t j = i;
+        while (j < s.size() && s[j] != '+' && s[j] != '-') ++j;
+        const string term = s.substr(i, j - i);
+        if (!term.empty()) {
+            const size_t star = term.find('*');
+            const string name = toUpper(star == string::npos ? term : term.substr(0, star));
+            const string rhs  = (star == string::npos) ? string() : toUpper(term.substr(star + 1));
+            w2::Reg r; uint8_t b;
+            const bool isReg = lookupRegSized(name, r, b) || isSegmentReg(name);
+            const bool rhsReg = !rhs.empty() && (lookupRegSized(rhs, r, b) || isSegmentReg(rhs));
+            if (star != string::npos && (isReg || rhsReg)) {            // ECX*4 or 4*ECX
+                ++regs; ++scaled;
+                if (sign == '-') { why = "a scaled index register cannot be subtracted"; return true; }
+            } else if (isReg) {
+                ++regs;
+                if (sign == '-') { why = "a register cannot be subtracted in a memory operand"; return true; }
+            } else if (star == string::npos && (isalpha(static_cast<unsigned char>(term[0])) || term[0] == '_')) {
+                ++labels;
+                if (sign == '-') { why = "a label cannot be subtracted in a memory operand"; return true; }
+            }
+        }
+        if (j >= s.size()) break;
+        sign = s[j];
+        i = j + 1;
+    }
+    if (scaled > 1) { why = "only one scaled index register is allowed in a memory operand"; return true; }
+    if (regs   > 2) { why = "at most two registers (base + index) are allowed in a memory operand"; return true; }
+    if (labels > 1) { why = "only one label is allowed in a memory operand"; return true; }
+    return false;
+}
 
 struct Lowering {
     const Worklet1Output&          ir;
@@ -109,6 +217,19 @@ struct Lowering {
     explicit Lowering(const Worklet1Output& o) : ir(o) { err.line = 0; }
 
     bool fail(const string& msg, int line) { err.message = msg; err.line = line; return false; }
+
+    // Access width of a memory operand (8/16/32; 0 = unspecified, 64 is rejected by Worklet 2).
+    static uint8_t memBits(const ::Operand& in) { return static_cast<uint8_t>(in.size); }
+
+    // Registers inside [...] must be 32-bit: Worklet 1 sizes memory operands without a
+    // 0x67 address-size prefix, so 16-bit addressing ([BX+SI]) cannot be encoded to match.
+    static string addrRegError(const char* role, const string& name) {
+        w2::Reg r; uint8_t bits;
+        if (lookupRegSized(name, r, bits))
+            return string("16/8-bit register '") + name + "' cannot be used as a memory " + role +
+                   " register (use the 32-bit register)";
+        return string("unknown ") + role + " register '" + name + "'";
+    }
 
     // Worklet 1 label NAME -> Worklet 2 label ID (via the label's address).
     bool labelId(const string& name, int line, w2::LabelId& id) {
@@ -121,9 +242,9 @@ struct Lowering {
     // Worklet 1 operand (REG / IMM / SYM / MEM) -> Worklet 2 operand.
     bool operand(const ::Operand& in, int line, bool symIsMemory, w2::Operand& out) {
         if (in.kind == "REG") {
-            w2::Reg r;
-            if (!lookupReg(in.value, r)) return fail("unknown register '" + in.value + "'", line);
-            out = w2::regOp(r);
+            w2::Reg r; uint8_t bits;
+            if (!lookupRegSized(in.value, r, bits)) return fail("unknown register '" + in.value + "'", line);
+            out = w2::regOp(r, bits);
             return true;
         }
         if (in.kind == "IMM") {
@@ -138,23 +259,49 @@ struct Lowering {
             return true;
         }
         if (in.kind == "MEM") {
-            if (!in.symbol.empty() && in.baseReg.empty() && in.indexReg.empty()) {
+            string why;
+            if (memExprProblem(in.value, why)) return fail(why + " ('" + in.value + "')", line);
+            // Worklet 1 accumulates the displacement in 64 bits; it must fit 32 bits.
+            if (in.displacement < -2147483648LL || in.displacement > 4294967295LL)
+                return fail("memory displacement out of 32-bit range in '" + in.value + "'", line);
+
+            const bool hasSym = !in.symbol.empty();
+            const int32_t disp = static_cast<int32_t>(static_cast<uint32_t>(in.displacement));
+
+            // [label]  -- the original, unchanged path
+            if (hasSym && in.baseReg.empty() && in.indexReg.empty() && in.displacement == 0) {
                 w2::LabelId id;
                 if (!labelId(in.symbol, line, id)) return false;
-                out = w2::labelMemOp(id);
+                out = w2::labelMemOp(id, memBits(in));
                 return true;
             }
+
             w2::Reg base = w2::Reg::NONE;
             w2::Reg index = w2::Reg::NONE;
             if (!in.baseReg.empty()) {
-                if (!lookupReg(in.baseReg, base)) return fail("unknown base register '" + in.baseReg + "'", line);
+                if (!lookupReg(in.baseReg, base)) return fail(addrRegError("base", in.baseReg), line);
             }
             if (!in.indexReg.empty()) {
-                if (!lookupReg(in.indexReg, index)) return fail("unknown index register '" + in.indexReg + "'", line);
+                if (!lookupReg(in.indexReg, index)) return fail(addrRegError("index", in.indexReg), line);
             }
             uint8_t sc = static_cast<uint8_t>(in.scale ? in.scale : 1);
-            int32_t disp = static_cast<int32_t>(in.displacement);
-            out = w2::memOp(base, index, sc, disp);
+
+            // ESP cannot be an index, but "[eax+esp]" == "[esp+eax]" (scale 1): swap, as real
+            // assemblers do. Skipped when the swap would change the size Worklet 1 already
+            // fixed (EBP as base needs a displacement byte; ESP alone without a base).
+            if (index == w2::Reg::ESP && sc == 1 && base != w2::Reg::NONE &&
+                base != w2::Reg::ESP && (base != w2::Reg::EBP || hasSym)) {
+                index = base;
+                base  = w2::Reg::ESP;
+            }
+
+            if (hasSym) {                                   // [label + base + index*scale + disp]
+                w2::LabelId id;
+                if (!labelId(in.symbol, line, id)) return false;
+                out = w2::labelMemOpEx(id, base, index, sc, disp, memBits(in));
+                return true;
+            }
+            out = w2::memOp(base, index, sc, disp, memBits(in));
             return true;
         }
         return fail("unknown operand kind '" + in.kind + "'", line);
@@ -164,7 +311,7 @@ struct Lowering {
     bool addressOperand(const ::Operand& in, int line, w2::Operand& out) {
         if (in.kind == "REG") {
             w2::Reg r;
-            if (!lookupReg(in.value, r)) return fail("unknown register '" + in.value + "'", line);
+            if (!lookupReg(in.value, r)) return fail(addrRegError("address", in.value), line);
             out = w2::memOp(r, w2::Reg::NONE, 1, 0);
             return true;
         }
@@ -211,10 +358,35 @@ struct Lowering {
                 continue;
             }
 
+            if (in.mnemonic == "LODS" || in.mnemonic == "STOS") {
+                // Size comes from the optional operand (AL/AX/EAX or BYTE/WORD/DWORD [..]); default dword.
+                unsigned bits = 32;
+                if (in.operands.size() == 1) {
+                    const ::Operand& o = in.operands[0];
+                    w2::Reg r; uint8_t rb;
+                    if (o.kind == "REG") {
+                        if (!lookupRegSized(o.value, r, rb))
+                            return fail(in.mnemonic + ": unsupported register '" + o.value + "'", in.line);
+                        bits = rb;
+                    }
+                    else if (o.kind == "MEM" && o.size) bits = static_cast<unsigned>(o.size);
+                }
+                const bool lods = (in.mnemonic == "LODS");
+                if      (bits == 8)  out.op = lods ? w2::Op::LODSB : w2::Op::STOSB;
+                else if (bits == 16) out.op = lods ? w2::Op::LODSW : w2::Op::STOSW;
+                else if (bits == 32) out.op = lods ? w2::Op::LODSD : w2::Op::STOSD;
+                else return fail(in.mnemonic + " operand size must be 8, 16 or 32 bits", in.line);
+                out.operandCount = 0;      // the operand only selects the size
+                continue;
+            }
+
             if (!lookupOp(in.mnemonic, out.op))
                 return fail("unsupported mnemonic '" + in.mnemonic + "'", in.line);
-            for (size_t k = 0; k < in.operands.size(); ++k)
-                if (!operand(in.operands[k], in.line, false, out.operands[k])) return false;
+            for (size_t k = 0; k < in.operands.size(); ++k) {
+                // LEA reg, label  ->  LEA reg, [label]  (the label is the memory operand whose address is wanted)
+                const bool leaLabel = (in.mnemonic == "LEA" && k == 1);
+                if (!operand(in.operands[k], in.line, leaLabel, out.operands[k])) return false;
+            }
         }
 
         // 3. Attach label definitions to the instruction that starts at their address.
@@ -281,7 +453,18 @@ int main(int argc, char** argv) {
     }
     const char* outPath = (argc > 2) ? argv[2] : "out.bin";
     // Load address added to [label] operands (LOAD/STORE). Default 0 = same as Worklet 1's addresses.
-    const uint32_t base = (argc > 3) ? static_cast<uint32_t>(std::strtoul(argv[3], 0, 0)) : 0u;
+    uint32_t base = 0u;
+    if (argc > 3) {
+        char* endp = 0;
+        errno = 0;
+        const unsigned long long v = std::strtoull(argv[3], &endp, 0);
+        if (endp == argv[3] || *endp != '\0' || errno == ERANGE || v > 0xFFFFFFFFull ||
+            argv[3][0] == '-') {
+            std::fprintf(stderr, "invalid base address '%s' (expected a number 0..0xFFFFFFFF)\n", argv[3]);
+            return 1;
+        }
+        base = static_cast<uint32_t>(v);
+    }
 
     // ---- Worklet 1 (unchanged) ----
     vector<string> sourceLines;
