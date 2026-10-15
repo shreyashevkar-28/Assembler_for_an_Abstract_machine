@@ -302,3 +302,511 @@ uint8_t jccOpcode(Op op) {
         default:      return 0x8F;      // JG
     }
 }
+// ---- one instruction -----------------------------------------------------------
+// Every case first resolves the operand size (8/16/32).  16-bit operations get a
+// 0x66 prefix; 8-bit operations use the "-1" opcode of the 32-bit form.  With no
+// size information at all the size is 32, exactly as before.
+Status encodeOne(const Instruction& in, std::vector<uint8_t>& out,
+                 std::vector<Fixup>& fixups, size_t idx) {
+    if (in.operandCount > 2) return Status::BAD_OPERANDS;
+    const unsigned n = in.operandCount;
+    const Operand& a = in.operands[0];
+    const Operand& b = in.operands[1];
+    unsigned bits = 32;
+    Status rs;
+
+    switch (in.op) {
+        case Op::NOP:
+            if (n != 0) return Status::BAD_OPERANDS;
+            put8(out, 0x90);
+            return Status::OK;
+
+        case Op::RET:
+            if (n != 0) return Status::BAD_OPERANDS;
+            put8(out, 0xC3);
+            return Status::OK;
+
+        case Op::PUSH:
+        case Op::POP:
+            if (n != 1 || !isRM(a)) return Status::BAD_OPERANDS;
+            if ((rs = resolveSize(&a, 0, bits)) != Status::OK) return rs;
+            if (bits == 8) return Status::BAD_OPERANDS;     // no 8-bit PUSH/POP
+            putPrefix(out, bits);
+            if (isReg(a)) {                                 // 50+rd / 58+rd
+                put8(out, (in.op == Op::PUSH ? 0x50u : 0x58u) + code(a.reg));
+                return Status::OK;
+            }
+            if (in.op == Op::PUSH) {                        // PUSH r/m   FF /6
+                put8(out, 0xFF);
+                return emitModRM(out, 6, a, fixups, idx);
+            }
+            put8(out, 0x8F);                                // POP  r/m   8F /0
+            return emitModRM(out, 0, a, fixups, idx);
+
+        case Op::INC:                                       // 40+rd   | FE/FF /0
+        case Op::DEC:                                       // 48+rd   | FE/FF /1
+            if (n != 1 || !isRM(a)) return Status::BAD_OPERANDS;
+            if ((rs = resolveSize(&a, 0, bits)) != Status::OK) return rs;
+            putPrefix(out, bits);
+            if (isReg(a) && bits != 8) {
+                put8(out, (in.op == Op::INC ? 0x40u : 0x48u) + code(a.reg));
+                return Status::OK;
+            }
+            put8(out, opc(bits, 0xFF));                     // FE /d (8-bit) or FF /d
+            return emitModRM(out, in.op == Op::INC ? 0u : 1u, a, fixups, idx);
+
+        case Op::JMP:
+        case Op::CALL:
+        case Op::JE:
+        case Op::JNE: {
+            if ((in.op == Op::JMP || in.op == Op::CALL) && n == 1 && isRM(a)) {
+                // Indirect near jump / call through a register or memory: FF /4, FF /2
+                if ((rs = resolveSize(&a, 0, bits)) != Status::OK) return rs;
+                if (bits == 8) return Status::BAD_OPERANDS;
+                putPrefix(out, bits);
+                put8(out, 0xFF);
+                return emitModRM(out, in.op == Op::JMP ? 4u : 2u, a, fixups, idx);
+            }
+            if (n != 1 || a.kind != OperandKind::LABEL) return Status::BAD_OPERANDS;
+            if (in.op == Op::JMP) {
+                put8(out, 0xE9);                            // JMP  rel32
+            } else if (in.op == Op::CALL) {
+                put8(out, 0xE8);                            // CALL rel32
+            } else {
+                put8(out, 0x0F);                            // Jcc  rel32
+                put8(out, in.op == Op::JE ? 0x84u : 0x85u);
+            }
+            Fixup f = { out.size(), a.label, idx, false, 0, false };
+            fixups.push_back(f);
+            put32(out, 0);                                  // rel32 placeholder
+            return Status::OK;
+        }
+
+        case Op::MOV: {
+            if (n != 2) return Status::BAD_OPERANDS;
+            if ((rs = resolveSize(&a, &b, bits)) != Status::OK) return rs;
+            if (isReg(a) && isImm(b)) {                     // MOV r, imm   B0+rb / B8+rd
+                if (!immFits(bits, b.imm)) return Status::BAD_IMMEDIATE;
+                putPrefix(out, bits);
+                put8(out, (bits == 8 ? 0xB0u : 0xB8u) + code(a.reg));
+                putImm(out, bits, b.imm);
+                return Status::OK;
+            }
+            if (isReg(a) && isRM(b)) {                      // MOV r, r/m   8A /r | 8B /r
+                putPrefix(out, bits);
+                put8(out, opc(bits, 0x8B));
+                return emitModRM(out, code(a.reg), b, fixups, idx);
+            }
+            if (isMem(a) && isReg(b)) {                     // MOV r/m, r   88 /r | 89 /r
+                putPrefix(out, bits);
+                put8(out, opc(bits, 0x89));
+                return emitModRM(out, code(b.reg), a, fixups, idx);
+            }
+            if (isMem(a) && isImm(b)) {                     // MOV r/m, imm C6 /0 | C7 /0
+                if (!immFits(bits, b.imm)) return Status::BAD_IMMEDIATE;
+                putPrefix(out, bits);
+                put8(out, opc(bits, 0xC7));
+                Status s = emitModRM(out, 0, a, fixups, idx);
+                if (s != Status::OK) return s;
+                putImm(out, bits, b.imm);
+                return Status::OK;
+            }
+            return Status::BAD_OPERANDS;
+        }
+
+        // ===== added instruction set ===========================================
+        case Op::HLT:  
+        case Op::CLC:   
+        case Op::STC:    
+        case Op::CLD:
+        case Op::STD:  
+        case Op::CDQ:   
+        case Op::LEAVE:  
+        case Op::PUSHAD:
+        case Op::POPAD: 
+        case Op::PUSHFD: 
+        case Op::POPFD:
+        case Op::CMC:
+        case Op::CWDE:
+        case Op::LODSB:
+        case Op::LODSD:
+        case Op::STOSB:
+        case Op::STOSD:
+        case Op::MOVSB:
+        case Op::MOVSD:
+        case Op::CMPSB:
+        case Op::CMPSD:
+        case Op::SCASB:
+        case Op::SCASD:
+        case Op::LAHF:
+        case Op::SAHF:
+        case Op::CLI:
+        case Op::STI:
+        case Op::WAIT:
+            if (n != 0) return Status::BAD_OPERANDS;
+            put8(out, singleByteOpcode(in.op));
+            return Status::OK;
+
+        case Op::CBW:                                       // 16-bit forms: 0x66 + opcode
+        case Op::CWD:
+        case Op::PUSHA:
+        case Op::POPA:
+        case Op::PUSHF:
+        case Op::POPF:
+        case Op::LODSW:
+        case Op::STOSW:
+        case Op::MOVSW:
+        case Op::CMPSW:
+        case Op::SCASW:
+            if (n != 0) return Status::BAD_OPERANDS;
+            put8(out, 0x66);
+            put8(out, prefixedOpcode(in.op));
+            return Status::OK;
+
+        case Op::NOT: 
+        case Op::NEG: 
+        case Op::MUL: 
+        case Op::DIV: 
+        case Op::IDIV: {
+            if (n != 1 || !isRM(a)) return Status::BAD_OPERANDS;
+            if ((rs = resolveSize(&a, 0, bits)) != Status::OK) return rs;
+            putPrefix(out, bits);
+            put8(out, opc(bits, 0xF7));                     // F6/F7 /digit
+            return emitModRM(out, unaryDigit(in.op), a, fixups, idx);
+        }
+
+        case Op::SHL: 
+        case Op::SHR: 
+        case Op::SAR:
+        case Op::ROL:
+        case Op::ROR:
+        case Op::RCL:
+        case Op::RCR: {
+            if (n != 2 || !isRM(a)) return Status::BAD_OPERANDS;
+            if ((rs = resolveSize(&a, 0, bits)) != Status::OK) return rs;
+            if (isReg(b)) {                                 // count in CL:  D2 /d | D3 /d
+                if (b.reg != Reg::CL || regBits(b) != 8) return Status::BAD_OPERANDS;
+                putPrefix(out, bits);
+                put8(out, opc(bits, 0xD3));
+                return emitModRM(out, shiftDigit(in.op), a, fixups, idx);
+            }
+            if (!isImm(b)) return Status::BAD_OPERANDS;
+            if (b.imm < 0 || b.imm > 31) return Status::BAD_IMMEDIATE;
+            putPrefix(out, bits);
+            if (b.imm == 1) {                               // D0/D1 /digit (shift by 1)
+                put8(out, opc(bits, 0xD1));
+                return emitModRM(out, shiftDigit(in.op), a, fixups, idx);
+            }
+            put8(out, opc(bits, 0xC1));                     // C0/C1 /digit ib
+            Status s = emitModRM(out, shiftDigit(in.op), a, fixups, idx);
+            if (s != Status::OK) return s;
+            put8(out, static_cast<uint32_t>(b.imm));
+            return Status::OK;
+        }
+
+        case Op::INT:
+            if (n != 1 || !isImm(a)) return Status::BAD_OPERANDS;
+            if (a.imm < 0 || a.imm > 255) return Status::BAD_IMMEDIATE;
+            put8(out, 0xCD);                                // CD ib
+            put8(out, static_cast<uint32_t>(a.imm));
+            return Status::OK;
+
+        case Op::XCHG:
+            if (n != 2) return Status::BAD_OPERANDS;
+            if ((rs = resolveSize(&a, &b, bits)) != Status::OK) return rs;
+            if (isReg(a) && isReg(b) && bits != 8) {
+                if (a.reg == Reg::EAX) {                    // 90+rd (AX/EAX short form)
+                    putPrefix(out, bits);
+                    put8(out, 0x90u + code(b.reg));
+                    return Status::OK;
+                }
+                if (b.reg == Reg::EAX) {                    // 90+rd
+                    putPrefix(out, bits);
+                    put8(out, 0x90u + code(a.reg));
+                    return Status::OK;
+                }
+            }
+            if (isRM(a) && isReg(b)) {                      // XCHG r/m, r   86 /r | 87 /r
+                putPrefix(out, bits);
+                put8(out, opc(bits, 0x87));
+                return emitModRM(out, code(b.reg), a, fixups, idx);
+            }
+            if (isReg(a) && isMem(b)) {                     // XCHG r, m  (operands commute)
+                putPrefix(out, bits);
+                put8(out, opc(bits, 0x87));
+                return emitModRM(out, code(a.reg), b, fixups, idx);
+            }
+            return Status::BAD_OPERANDS;
+
+        case Op::IMUL:
+            if (n == 1) {                                   // IMUL r/m   F6/F7 /5
+                if (!isRM(a)) return Status::BAD_OPERANDS;
+                if ((rs = resolveSize(&a, 0, bits)) != Status::OK) return rs;
+                putPrefix(out, bits);
+                put8(out, opc(bits, 0xF7));
+                return emitModRM(out, 5, a, fixups, idx);
+            }
+            if (n != 2 || !isReg(a)) return Status::BAD_OPERANDS;
+            if ((rs = resolveSize(&a, &b, bits)) != Status::OK) return rs;
+            if (bits == 8) return Status::BAD_OPERANDS;     // no 2-operand 8-bit IMUL
+            if (isRM(b)) {                                  // IMUL r, r/m   0F AF /r
+                putPrefix(out, bits);
+                put8(out, 0x0F);
+                put8(out, 0xAF);
+                return emitModRM(out, code(a.reg), b, fixups, idx);
+            }
+            if (isImm(b)) {                                 // IMUL r, imm  == IMUL r, r, imm
+                if (!immFits(bits, b.imm)) return Status::BAD_IMMEDIATE;
+                putPrefix(out, bits);
+                if (fitsInt8(b.imm)) {                      // 6B /r ib
+                    put8(out, 0x6B);
+                    Status s = emitModRM(out, code(a.reg), a, fixups, idx);
+                    if (s != Status::OK) return s;
+                    put8(out, static_cast<uint32_t>(b.imm));
+                } else {                                    // 69 /r iw|id
+                    put8(out, 0x69);
+                    Status s = emitModRM(out, code(a.reg), a, fixups, idx);
+                    if (s != Status::OK) return s;
+                    putImm(out, bits, b.imm);
+                }
+                return Status::OK;
+            }
+            return Status::BAD_OPERANDS;
+
+        case Op::TEST: {
+            if (n != 2) return Status::BAD_OPERANDS;
+            if ((rs = resolveSize(&a, &b, bits)) != Status::OK) return rs;
+            if (isRM(a) && isImm(b)) {
+                if (!immFits(bits, b.imm)) return Status::BAD_IMMEDIATE;
+                putPrefix(out, bits);
+                if (isReg(a) && a.reg == Reg::EAX) {        // TEST AL/AX/EAX, imm   A8 / A9
+                    put8(out, opc(bits, 0xA9));
+                    putImm(out, bits, b.imm);
+                    return Status::OK;
+                }
+                put8(out, opc(bits, 0xF7));                 // TEST r/m, imm  F6/F7 /0
+                Status s = emitModRM(out, 0, a, fixups, idx);
+                if (s != Status::OK) return s;
+                putImm(out, bits, b.imm);
+                return Status::OK;
+            }
+            if (isRM(a) && isReg(b)) {                      // TEST r/m, r   84/85 /r
+                putPrefix(out, bits);
+                put8(out, opc(bits, 0x85));
+                return emitModRM(out, code(b.reg), a, fixups, idx);
+            }
+            if (isReg(a) && isMem(b)) {                     // TEST r, m  (operands commute)
+                putPrefix(out, bits);
+                put8(out, opc(bits, 0x85));
+                return emitModRM(out, code(a.reg), b, fixups, idx);
+            }
+            return Status::BAD_OPERANDS;
+        }
+
+        case Op::LOOP:
+        case Op::LOOPE:
+        case Op::LOOPNE:
+        case Op::JECXZ: {
+            if (n != 1 || a.kind != OperandKind::LABEL) return Status::BAD_OPERANDS;
+            put8(out, in.op == Op::LOOPNE ? 0xE0u : in.op == Op::LOOPE ? 0xE1u
+                    : in.op == Op::LOOP   ? 0xE2u : 0xE3u);     // E0 / E1 / E2 / E3 cb
+            Fixup f = { out.size(), a.label, idx, false, 0, true };
+            fixups.push_back(f);
+            put8(out, 0);                                       // rel8 placeholder
+            return Status::OK;
+        }
+
+        case Op::JL: 
+        case Op::JGE: 
+        case Op::JLE: 
+        case Op::JG:
+        case Op::JB: 
+        case Op::JAE: 
+        case Op::JBE: 
+        case Op::JA:
+        case Op::JS: 
+        case Op::JNS:
+        case Op::JO:
+        case Op::JNO:
+        case Op::JP:
+        case Op::JNP: {
+            if (n != 1 || a.kind != OperandKind::LABEL) return Status::BAD_OPERANDS;
+            put8(out, 0x0F);                                // Jcc rel32   0F 8x id
+            put8(out, jccOpcode(in.op));
+            Fixup f = { out.size(), a.label, idx, false, 0, false };
+            fixups.push_back(f);
+            put32(out, 0);                                  // rel32 placeholder
+            return Status::OK;
+        }
+
+        case Op::LEA: {
+            if (n != 2 || !isReg(a) || !isMem(b)) return Status::BAD_OPERANDS;
+            if ((rs = resolveSize(&a, &b, bits)) != Status::OK) return rs;
+            if (bits == 8) return Status::BAD_OPERANDS;     // LEA has no 8-bit form
+            putPrefix(out, bits);
+            put8(out, 0x8D);                                // 8D /r
+            return emitModRM(out, code(a.reg), b, fixups, idx);
+        }
+        // =======================================================================
+
+        default:
+            break;                                          // ALU group below
+    }
+
+    uint8_t rmR, rRm, ext;
+    if (!aluForm(in.op, rmR, rRm, ext)) return Status::BAD_OPCODE;
+    if (n != 2) return Status::BAD_OPERANDS;
+    if ((rs = resolveSize(&a, &b, bits)) != Status::OK) return rs;
+
+    if (isRM(a) && isImm(b)) {
+        if (!immFits(bits, b.imm)) return Status::BAD_IMMEDIATE;
+        if (bits == 8) {
+            // op AL, imm8 (opcode+3, no ModRM) -- Worklet 1 sizes this as 2 bytes;
+            // every other 8-bit target is 80 /d ib (3 bytes with a register).
+            if (isReg(a) && a.reg == Reg::EAX) {
+                put8(out, rmR + 3u);
+                put8(out, static_cast<uint32_t>(b.imm));
+                return Status::OK;
+            }
+            put8(out, 0x80);
+            Status s = emitModRM(out, ext, a, fixups, idx);
+            if (s != Status::OK) return s;
+            put8(out, static_cast<uint32_t>(b.imm));
+            return Status::OK;
+        }
+        const bool short8 = fitsInt8(b.imm);
+        putPrefix(out, bits);
+        // op AX/EAX, imm  (opcode+4, no ModRM) -- the short form that Worklet 1's
+        // Pass 1 assumes whenever the immediate doesn't fit in 8 bits.
+        if (!short8 && isReg(a) && a.reg == Reg::EAX) {
+            put8(out, rmR + 4u);
+            putImm(out, bits, b.imm);
+            return Status::OK;
+        }
+        put8(out, short8 ? 0x83u : 0x81u);                  // 83 /d ib  or  81 /d iw|id
+        Status s = emitModRM(out, ext, a, fixups, idx);
+        if (s != Status::OK) return s;
+        if (short8) put8(out, static_cast<uint32_t>(b.imm));
+        else        putImm(out, bits, b.imm);
+        return Status::OK;
+    }
+    if (isReg(a) && isRM(b)) {                              // op r, r/m   /r
+        putPrefix(out, bits);
+        put8(out, opc(bits, rRm));
+        return emitModRM(out, code(a.reg), b, fixups, idx);
+    }
+    if (isMem(a) && isReg(b)) {                             // op r/m, r   /r
+        putPrefix(out, bits);
+        put8(out, opc(bits, rmR));
+        return emitModRM(out, code(b.reg), a, fixups, idx);
+    }
+    return Status::BAD_OPERANDS;
+}
+
+Result fail(Status s, size_t idx) {
+    Result r = { s, idx };
+    return r;
+}
+
+Result encodeImpl(const Program& prog, std::vector<uint8_t>& out,
+                  std::vector<size_t>* offs) {
+    out.reserve(prog.count * 8);
+    if (offs) offs->reserve(prog.count + 1);
+
+    std::vector<size_t> labelOffset(prog.labelCount, kUndefined);   // O(1) lookup by label ID
+    std::vector<Fixup>  fixups;
+
+    // Single pass: emit bytes, record where each label lands.
+    for (size_t i = 0; i < prog.count; ++i) {
+        const Instruction& in = prog.instrs[i];
+
+        if (in.defLabel != NO_LABEL) {
+            if (in.defLabel >= prog.labelCount)          return fail(Status::LABEL_OUT_OF_RANGE, i);
+            if (labelOffset[in.defLabel] != kUndefined)  return fail(Status::DUPLICATE_LABEL, i);
+            labelOffset[in.defLabel] = out.size();
+        }
+        if (offs) offs->push_back(out.size());
+
+        Status s = encodeOne(in, out, fixups, i);
+        if (s != Status::OK) return fail(s, i);
+    }
+    if (offs) offs->push_back(out.size());                  // total size
+
+    // A label that sits after the last instruction.
+    if (prog.endLabel != NO_LABEL) {
+        if (prog.endLabel >= prog.labelCount)            return fail(Status::LABEL_OUT_OF_RANGE, prog.count);
+        if (labelOffset[prog.endLabel] != kUndefined)    return fail(Status::DUPLICATE_LABEL, prog.count);
+        labelOffset[prog.endLabel] = out.size();
+    }
+
+    // Back-patch label references.
+    //   relative: rel32 = target - (address of the byte after the rel32 field)
+    //   absolute: baseAddress + target + addend
+    for (size_t k = 0; k < fixups.size(); ++k) {
+        const Fixup& f = fixups[k];
+        if (f.label >= prog.labelCount)        return fail(Status::LABEL_OUT_OF_RANGE, f.instr);
+        const size_t target = labelOffset[f.label];
+        if (target == kUndefined)              return fail(Status::UNDEFINED_LABEL, f.instr);
+
+        if (f.rel8) {                                       // 1-byte relative field
+            const int64_t rel8 = static_cast<int64_t>(target) - static_cast<int64_t>(f.pos + 1);
+            if (rel8 < -128 || rel8 > 127) return fail(Status::BRANCH_OUT_OF_RANGE, f.instr);
+            out[f.pos] = static_cast<uint8_t>(rel8);
+            continue;
+        }
+
+        uint32_t v;
+        if (f.absolute) {
+            v = prog.baseAddress + static_cast<uint32_t>(target) + static_cast<uint32_t>(f.addend);
+        } else {
+            const int64_t rel = static_cast<int64_t>(target) - static_cast<int64_t>(f.pos + 4);
+            v = static_cast<uint32_t>(rel);                 // two's-complement wrap is intended
+        }
+        patch32(out, f.pos, v);
+    }
+
+    return fail(Status::OK, 0);
+}
+
+} // namespace
+
+const char* statusText(Status s) {
+    switch (s) {
+        case Status::OK:                 return "OK";
+        case Status::BAD_OPCODE:         return "opcode not handled";
+        case Status::BAD_OPERANDS:       return "wrong operand count or unsupported operand combination";
+        case Status::BAD_SCALE:          return "memory scale must be 1, 2, 4 or 8";
+        case Status::BAD_INDEX_REG:      return "ESP cannot be an index register";
+        case Status::LABEL_OUT_OF_RANGE: return "label ID out of range";
+        case Status::DUPLICATE_LABEL:    return "label defined twice";
+        case Status::UNDEFINED_LABEL:    return "label referenced but never defined";
+        case Status::BAD_IMMEDIATE:      return "immediate out of range for this instruction";
+        case Status::BAD_OPERAND_SIZE:   return "operand sizes conflict (8/16/32-bit mismatch)";
+        case Status::BRANCH_OUT_OF_RANGE:return "short jump target out of range (LOOP/JECXZ reach is -128..+127 bytes)";
+    }
+    return "unknown status";
+}
+
+Result encode(const Program& prog, std::vector<uint8_t>& out, std::vector<size_t>* instrOffsets) {
+    out.clear();
+    if (instrOffsets) instrOffsets->clear();
+
+    Result r = encodeImpl(prog, out, instrOffsets);
+    if (r.status != Status::OK) {
+        out.clear();
+        if (instrOffsets) instrOffsets->clear();
+    }
+    return r;
+}
+
+bool writeBinFile(const char* path, const std::vector<uint8_t>& bytes) {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    if (!bytes.empty()) {
+        f.write(reinterpret_cast<const char*>(&bytes[0]), static_cast<std::streamsize>(bytes.size()));
+    }
+    f.close();
+    return !f.fail();
+}
+
+} 
